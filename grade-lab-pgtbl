@@ -22,11 +22,13 @@ IDX_RE = "(idx: [0-9]+)"
 VAL_RE = "(0x[0-9a-f]+)"
 FLAGS_RE = "([-r][-w][-x][-u])"
 INDENT_RE = r"\s*\|\|\s*"
-INDENT_ESC = "\\\s*\|\|\\\s*"
+INDENT_ESC = "\\\\s*\\|\\|\\\\s*"
 
 @test(50, "pte printout")
 def test_pteprint():
     first = True
+    cur_idx = 0
+    first_non_leaf_pte = True
     r.run_qemu(shell_script([
         'echo hi'
     ]))
@@ -34,25 +36,25 @@ def test_pteprint():
     p = re.compile(VAL_RE)
     d = re.compile(INDENT_RE)
     f = re.compile(FLAGS_RE)
-    for l in PTE_PRINT.splitlines():
+    for l in PTE_PRINT.splitlines() :
         l = d.sub(INDENT_ESC, l)
         l = p.sub(VAL_RE, l)
         l = f.sub(FLAGS_RE, l)
-        r.match(r'^{}$'.format(l))
-        # print("l:", l)
+        r.match(r'^{}\s*$'.format(l))
         if first:
             first = False
         else:
-            matches = re.findall(r'^{}$'.format(l), r.qemu.output, re.MULTILINE)
-            # print("matches:", matches[0])
+            matches = re.findall(r'^{}\s*$'.format(l), r.qemu.output, re.MULTILINE)
             idx = int(re.findall(IDX_RE, l)[0][5:])
-            # print("idx:", idx)
-            # flags = matches[0][-1]
-            # pa = matches[0][-2]
             if len(matches[0]) > 2:
-                va = matches[0][-3]
-                # print("va:", va)
-                assert_equal((int(va, 16) >> 12) & 0x1ff, idx)
+                first_non_leaf_pte = True
+                va = matches[0][0]
+                assert_equal((int(va, 16) >> 12), idx + (cur_idx << 9))
+            elif len(matches[0]) == 2:
+                if first_non_leaf_pte:
+                    first_non_leaf_pte = False
+                    cur_idx = 0
+                cur_idx = (cur_idx << 9) + idx
 
     
 
