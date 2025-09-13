@@ -1,3 +1,3 @@
-# XV6-OSLAB24-HITSZ
+# oslabs-2025
 
-2024年 HITSZ的xv6 OS实验
+2025秋季学期哈工大（深圳）操作系统课实验
