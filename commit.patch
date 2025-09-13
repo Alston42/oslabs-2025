@@ -1,0 +1,242 @@
+diff --git a/Makefile b/Makefile
+index b971308..1f68a81 100644
+--- a/Makefile
++++ b/Makefile
+@@ -157,6 +157,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sleep\
++	$U/_pingpong\
++	$U/_find\
+ 
+ 
+ ifeq ($(LAB),syscall)
+@@ -242,15 +245,8 @@ qemu-gdb: $K/kernel .gdbinit fs.img
+ 	@echo "*** Now run 'gdb' in another window." 1>&2
+ 	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/commands.gdb b/commands.gdb
+new file mode 100644
+index 0000000..9697f3e
+--- /dev/null
++++ b/commands.gdb
+@@ -0,0 +1,7 @@
++b *0x80001e40
++c
++p p->name
++b *0x800029b2
++c
++p p->name
++da
+\ No newline at end of file
+diff --git a/grade-lab-util b/grade-lab-util
+index 5f5446a..446f972 100755
+--- a/grade-lab-util
++++ b/grade-lab-util
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python3
+ 
+ import re
+ from gradelib import *
+diff --git a/user/find.c b/user/find.c
+new file mode 100644
+index 0000000..4c5e085
+--- /dev/null
++++ b/user/find.c
+@@ -0,0 +1,110 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++
++char *fmtname(char *path) {
++  static char buf[DIRSIZ + 1];
++  char *p;
++
++  // Find first character after last slash.
++  for (p = path + strlen(path); p >= path && *p != '/'; p--)
++    ;
++  p++;
++
++  // Return blank-padded name.
++  if (strlen(p) >= DIRSIZ) return p;
++  memmove(buf, p, strlen(p));
++  memset(buf + strlen(p), ' ', DIRSIZ - strlen(p));
++  return buf;
++}
++
++int strmat(char *str, char *pattern) {
++    int m = strlen(pattern), n = strlen(str);
++    int pi[m];
++    for (int i = 0; i < m; i++) pi[i] = 0;
++    int j = 0;
++    for (int i = 1; i < m; i++) {
++        while (j > 0 && pattern[j] != pattern[i]) j = pi[j-1];
++        if (pattern[j] == pattern[i]) j++;
++        pi[i] = j;
++    }
++    j = 0;
++    for (int i = 0; i < n; i++) {
++        while (j > 0 && pattern[j] != str[i]) j = pi[j-1];
++        if (pattern[j] == str[i]) j++;
++        if (j == m) return i - m + 1;
++    }
++    return -1;
++}
++
++
++
++void find(char *path, char *name) {
++  char buf[512], *p;  // 用于构建完整路径的缓冲区和指针
++  int fd;             // 文件描述符
++  struct dirent de;   // 目录项结构，用于存储目录中的文件信息
++  struct stat st;     // 文件状态结构，用于存储文件的元数据
++
++  // 尝试打开指定路径的文件或目录
++  if ((fd = open(path, 0)) < 0) {
++    fprintf(2, "ls: cannot open %s\n", path);
++    return;
++  }
++
++  // 获取文件或目录的状态信息
++  if (fstat(fd, &st) < 0) {
++    fprintf(2, "ls: cannot stat %s\n", path);
++    close(fd);
++    return;
++  }
++
++  // 根据文件类型进行处理
++  switch (st.type) {
++    // 如果是普通文件，直接匹配
++    case T_FILE:
++      if (strmat(fmtname(path), name) != -1)
++        printf("%s\n", path);
++      break;
++
++    // 如果是目录，遍历目录中的所有文件
++    case T_DIR:
++      // 检查路径长度是否超过缓冲区大小
++      if (strlen(path) + 1 + DIRSIZ + 1 > sizeof buf) {
++        printf("find: path too long\n");
++        break;
++      }
++      // 构建目录路径的完整形式
++      strcpy(buf, path);
++      p = buf + strlen(buf);
++      *p++ = '/';  // 添加路径分隔符
++      // 读取目录中的每个条目
++      while (read(fd, &de, sizeof(de)) == sizeof(de)) {
++        if (de.inum == 0) continue;  // 跳过空条目
++        // 将文件名复制到路径缓冲区
++        memmove(p, de.name, DIRSIZ);
++        p[DIRSIZ] = 0;
++        // 获取文件状态
++        int sub_fd = open(buf, 0);
++        if (sub_fd < 0) continue;
++        struct stat sub_st;
++        int r = fstat(sub_fd, &sub_st);
++        close(sub_fd);
++        if (r < 0) continue;
++        if (strmat(p, name) != -1) printf("%s\n", buf);
++        if (sub_st.type == T_DIR && strcmp(p, ".") != 0 && strcmp(p, "..") != 0) find(buf, name);
++      }
++      break;
++  }
++  close(fd);  // 关闭文件描述符
++}
++
++int main(int argc, char *argv[]) {
++
++  if (argc != 3) {
++    printf("Find needs two argument!\n");  // 检查参数数量是否正确
++    exit(-1);
++  }
++  find(argv[1], argv[2]);
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/pingpong.c b/user/pingpong.c
+new file mode 100644
+index 0000000..a7e73d0
+--- /dev/null
++++ b/user/pingpong.c
+@@ -0,0 +1,43 @@
++#include "kernel/types.h"
++#include "user.h"
++
++int main(int argc, char* argv[]) {
++    int f2c[2];
++    pipe(f2c);
++    int c2f[2];
++    pipe(c2f);
++    char buf[512];
++    char pid[512];
++    
++    if (fork() == 0) {
++        /* 子进程代码块 */
++        // ping
++        close(f2c[1]);
++        read(f2c[0], buf, sizeof(buf));
++        printf("%d: received ping from pid %s\n", getpid(), buf);
++        close(f2c[0]);
++
++        // pong
++        close(c2f[0]);
++        itoa(getpid(), pid);
++        write(c2f[1], pid, sizeof(pid));
++        close(c2f[1]);
++        exit(0);
++    } else {
++        /* 父进程代码块 */
++        // ping
++        close(f2c[0]);
++        itoa(getpid(), pid);
++        write(f2c[1], pid, sizeof(pid));
++        close(f2c[1]);
++        
++        // pong
++        close(c2f[1]);
++        read(c2f[0], buf, sizeof(buf));
++        printf("%d: received pong from pid %s\n", getpid(), buf);
++        close(c2f[0]);
++        exit(0);
++    }
++
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..7f43fdb
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,13 @@
++#include "kernel/types.h"
++#include "user.h"
++
++int main(int argc, char* argv[]) {
++    if (argc != 2) {
++        printf("Sleep needs one argument!\n");  // 检查参数数量是否正确
++        exit(-1);
++    }
++    int ticks = atoi(argv[1]);
++    sleep(ticks);
++    printf("(nothing happens for a little while)\n");
++    exit(0);
++}
+\ No newline at end of file
