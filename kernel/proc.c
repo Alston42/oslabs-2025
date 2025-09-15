@@ -291,6 +291,30 @@ void reparent(struct proc *p) {
   }
 }
 
+char* proc_state(char *dst, enum procstate state) {
+  char *state_str = dst;
+  switch (state) {
+    case UNUSED:
+      safestrcpy(state_str, "UNUSED", sizeof(state_str));
+      break;
+    case SLEEPING:
+      safestrcpy(state_str, "SLEEPING", sizeof(state_str));
+      break;
+    case RUNNABLE:
+      safestrcpy(state_str, "RUNNABLE", sizeof(state_str));
+      break;
+    case RUNNING:
+      safestrcpy(state_str, "RUNNING", sizeof(state_str));
+      break;
+    case ZOMBIE:
+    default:
+      safestrcpy(state_str, "ZOMBIE", sizeof(state_str));
+      break;
+  }
+
+  return dst;
+}
+
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
@@ -312,6 +336,17 @@ void exit(int status) {
   iput(p->cwd);
   end_op();
   p->cwd = 0;
+
+  char *state_str = "SLEEPING";
+  printf("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, p->parent->pid, p->name, proc_state(state_str, p->state));
+
+  struct proc *pp;
+  int n = 0;
+  for (pp = proc; pp < &proc[NPROC]; pp++) {
+    if (pp->parent == p) {
+      printf("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, n++, pp->pid, pp->name, proc_state(state_str, pp->state));
+    }
+  }
 
   // we might re-parent a child to init. we can't be precise about
   // waking up init, since we can't acquire its lock once we've
@@ -356,7 +391,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr, int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -401,7 +436,10 @@ int wait(uint64 addr) {
     }
 
     // Wait for a child to exit.
-    sleep(p, &p->lock);  // DOC: wait-sleep
+    if (flags == 1) {
+      release(&p->lock);
+      return -1;
+    } else sleep(p, &p->lock);  // DOC: wait-sleep
   }
 }
 
