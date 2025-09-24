@@ -379,3 +379,38 @@ int test_pagetable() {
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
 }
+
+#define FLAG_CHAR(cond, ch) ((cond) ? ch : "-")
+#define FLAGS_STR(r, w, x, u) \
+    FLAG_CHAR(r, "r"), FLAG_CHAR(w, "w"), FLAG_CHAR(x, "x"), FLAG_CHAR(u, "u")
+#define PTE_FLAGS_STR(pte) \
+    FLAGS_STR(pte & PTE_R, pte & PTE_W, pte & PTE_X, pte & PTE_U)
+
+void vmprintwalk(pagetable_t pgtbl, int level, uint64 va_base) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pgtbl[i];
+    if (pte & PTE_V) { // PTE Valid
+      for (int j = 0; j < level; ++j)
+        printf("   ||");
+      printf("||idx: %d: ", i);
+
+      uint64 pa = PTE2PA(pte);
+
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        // 指向下一级页表的PTE
+        printf("pa: %p, flags: %s%s%s%s\n", pa, PTE_FLAGS_STR(pte));
+        vmprintwalk((pagetable_t)pa, level + 1, va_base * 512 + i);
+      } else if (pte & PTE_V) {
+        // 叶子PTE
+        uint64 va = (va_base * 512 + i) << 12;
+        printf("va: %p -> pa: %p, flags: %s%s%s%s\n", va, PTE2PA(pte), PTE_FLAGS_STR(pte));
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pgtbl) {
+  printf("page table %p\n", pgtbl);
+  
+  vmprintwalk(pgtbl, 0, 0);
+}
