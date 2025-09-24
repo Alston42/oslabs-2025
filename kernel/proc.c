@@ -37,6 +37,7 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    p->kstack_pa = (uint64)pa;
   }
   kvminithart();
 }
@@ -111,6 +112,11 @@ found:
     return 0;
   }
 
+  // Allocate a user's kernel pagetable.
+  p->k_pagetable = proc_kvminit();
+  printf("kvmtest1\n");
+  proc_kvmmap(p->k_pagetable, p->kstack, p->kstack_pa, PGSIZE, PTE_R | PTE_W);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -128,6 +134,8 @@ static void freeproc(struct proc *p) {
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if (p->k_pagetable) proc_freewalk(p->k_pagetable);
+  p->k_pagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -432,6 +440,10 @@ void scheduler(void) {
         c->proc = p;
         swtch(&c->context, &p->context);
 
+        // Switch to Proc's Kernel PageTable
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
@@ -442,6 +454,7 @@ void scheduler(void) {
     }
 #if !defined(LAB_FS)
     if (found == 0) {
+      kvminithart(); // No RUNNABLE process, Switch to Kernel PageTable
       intr_on();
       asm volatile("wfi");
     }

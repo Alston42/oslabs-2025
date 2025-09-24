@@ -45,6 +45,33 @@ void kvminit() {
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
+void proc_kvmmap(pagetable_t k_pagetable, uint64 va, uint64 pa, uint64 sz, int perm);
+pagetable_t proc_kvminit() {
+  pagetable_t k_pagetable = (pagetable_t)kalloc();
+  memset(k_pagetable, 0, PGSIZE);
+
+  // uart registers
+  proc_kvmmap(k_pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  proc_kvmmap(k_pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // PLIC
+  proc_kvmmap(k_pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  proc_kvmmap(k_pagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  proc_kvmmap(k_pagetable, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  proc_kvmmap(k_pagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return k_pagetable;
+}
+
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
 void kvminithart() {
@@ -102,6 +129,10 @@ uint64 walkaddr(pagetable_t pagetable, uint64 va) {
 // does not flush TLB or enable paging.
 void kvmmap(uint64 va, uint64 pa, uint64 sz, int perm) {
   if (mappages(kernel_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
+}
+
+void proc_kvmmap(pagetable_t k_pagetable, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(k_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
 }
 
 // translate a kernel virtual address to
@@ -243,6 +274,19 @@ void freewalk(pagetable_t pagetable) {
   kfree((void *)pagetable);
 }
 
+void proc_freewalk(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      uint64 child = PTE2PA(pte);
+      freewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+    // 叶子页表项指向了共享的物理页，不需要释放
+  }
+  kfree((void *)pagetable);
+}
+
 // Free user memory pages,
 // then free page-table pages.
 void uvmfree(pagetable_t pagetable, uint64 sz) {
@@ -378,4 +422,39 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+#define FLAG_CHAR(cond, ch) ((cond) ? ch : "-")
+#define FLAGS_STR(r, w, x, u) \
+    FLAG_CHAR(r, "r"), FLAG_CHAR(w, "w"), FLAG_CHAR(x, "x"), FLAG_CHAR(u, "u")
+#define PTE_FLAGS_STR(pte) \
+    FLAGS_STR(pte & PTE_R, pte & PTE_W, pte & PTE_X, pte & PTE_U)
+
+void vmprintwalk(pagetable_t pgtbl, int level, uint64 va_base) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pgtbl[i];
+    if (pte & PTE_V) { // PTE Valid
+      for (int j = 0; j < level; ++j)
+        printf("   ||");
+      printf("||idx: %d: ", i);
+
+      uint64 pa = PTE2PA(pte);
+
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        // 指向下一级页表的PTE
+        printf("pa: %p, flags: %s%s%s%s\n", pa, PTE_FLAGS_STR(pte));
+        vmprintwalk((pagetable_t)pa, level + 1, va_base * 512 + i);
+      } else if (pte & PTE_V) {
+        // 叶子PTE
+        uint64 va = (va_base * 512 + i) << 12;
+        printf("va: %p -> pa: %p, flags: %s%s%s%s\n", va, PTE2PA(pte), PTE_FLAGS_STR(pte));
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pgtbl) {
+  printf("page table %p\n", pgtbl);
+  
+  vmprintwalk(pgtbl, 0, 0);
 }
