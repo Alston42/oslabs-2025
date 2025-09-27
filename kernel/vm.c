@@ -19,8 +19,7 @@ extern char trampoline[];  // trampoline.S
  * create a direct-map page table for the kernel.
  */
 void kvminit() {
-  kernel_pagetable = (pagetable_t)kalloc();
-  memset(kernel_pagetable, 0, PGSIZE);
+  if ((kernel_pagetable = vmcreate()) == 0) panic("kvminit: out of memory");
 
   // uart registers
   kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
@@ -97,11 +96,15 @@ uint64 walkaddr(pagetable_t pagetable, uint64 va) {
   return pa;
 }
 
+void pgtbl_vmmap(pagetable_t pgtbl, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(pgtbl, va, sz, pa, perm) != 0) panic("kvmmap");
+}
+
 // add a mapping to the kernel page table.
 // only used when booting.
 // does not flush TLB or enable paging.
 void kvmmap(uint64 va, uint64 pa, uint64 sz, int perm) {
-  if (mappages(kernel_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
+  pgtbl_vmmap(kernel_pagetable, va, pa, sz, perm);
 }
 
 // translate a kernel virtual address to
@@ -144,16 +147,16 @@ int mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 // Remove npages of mappings starting from va. va must be
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
-void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free) {
+void vmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free) {
   uint64 a;
   pte_t *pte;
 
-  if ((va % PGSIZE) != 0) panic("uvmunmap: not aligned");
+  if ((va % PGSIZE) != 0) panic("vmunmap: not aligned");
 
   for (a = va; a < va + npages * PGSIZE; a += PGSIZE) {
-    if ((pte = walk(pagetable, a, 0)) == 0) panic("uvmunmap: walk");
-    if ((*pte & PTE_V) == 0) panic("uvmunmap: not mapped");
-    if (PTE_FLAGS(*pte) == PTE_V) panic("uvmunmap: not a leaf");
+    if ((pte = walk(pagetable, a, 0)) == 0) panic("vmunmap: walk");
+    if ((*pte & PTE_V) == 0) panic("vmunmap: not mapped");
+    if (PTE_FLAGS(*pte) == PTE_V) panic("vmunmap: not a leaf");
     if (do_free) {
       uint64 pa = PTE2PA(*pte);
       kfree((void *)pa);
@@ -162,9 +165,9 @@ void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free) {
   }
 }
 
-// create an empty user page table.
+// create an empty page table.
 // returns 0 if out of memory.
-pagetable_t uvmcreate() {
+pagetable_t vmcreate() {
   pagetable_t pagetable;
   pagetable = (pagetable_t)kalloc();
   if (pagetable == 0) return 0;
@@ -219,7 +222,7 @@ uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz) {
 
   if (PGROUNDUP(newsz) < PGROUNDUP(oldsz)) {
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
-    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+    vmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
   }
 
   return newsz;
@@ -243,11 +246,29 @@ void freewalk(pagetable_t pagetable) {
   kfree((void *)pagetable);
 }
 
+// Recursively free kernel page-table pages.
+// Leaf mappings point to shared Physical Page, needn't released.
+void kfreewalk(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      uint64 child = PTE2PA(pte);
+      kfreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
+}
+
 // Free user memory pages,
 // then free page-table pages.
 void uvmfree(pagetable_t pagetable, uint64 sz) {
-  if (sz > 0) uvmunmap(pagetable, 0, PGROUNDUP(sz) / PGSIZE, 1);
+  if (sz > 0) vmunmap(pagetable, 0, PGROUNDUP(sz) / PGSIZE, 1);
   freewalk(pagetable);
+}
+
+void kvmfree(pagetable_t pagetable) {
+  kfreewalk(pagetable);
 }
 
 // Given a parent process's page table, copy
@@ -277,7 +298,7 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz) {
   return 0;
 
 err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+  vmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
 

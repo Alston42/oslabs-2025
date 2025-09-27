@@ -31,7 +31,7 @@ int exec(char *path, char **argv) {
   if (readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf)) goto bad;
   if (elf.magic != ELF_MAGIC) goto bad;
 
-  if ((pagetable = proc_pagetable(p)) == 0) goto bad;
+  if ((pagetable = proc_uvminit(p)) == 0) goto bad;
 
   // Load program into memory.
   for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
