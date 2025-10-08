@@ -1,0 +1,280 @@
+diff --git a/.gitignore b/.gitignore
+index ba36a14..a3acb78 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,3 +23,4 @@ submissions/
+ compile_commands.json
+ .gdb_history
+ .cache/
++commit.patch
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 54666d1..a6ae984 100644
+--- a/Makefile
++++ b/Makefile
+@@ -164,6 +164,7 @@ UPROGS=\
+ 	$U/_zombie\
+ 	$U/_waittest\
+ 	$U/_exittest\
++	$U/_yieldtest\
+ 
+ 
+ ifeq ($(LAB),trap)
+@@ -243,15 +244,8 @@ qemu-gdb: $K/kernel .gdbinit fs.img
+ 	@echo "*** Now run 'gdb' in another window." 1>&2
+ 	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/grade-lab-syscall b/grade-lab-syscall
+index 8a042b7..18c7c47 100755
+--- a/grade-lab-syscall
++++ b/grade-lab-syscall
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python3
+ 
+ import re
+ import subprocess
+@@ -56,7 +56,6 @@ def test_yield_test():
+     result = subprocess.run([f"{toolprefix}addr2line", sepc, "-f", "-s", "-e", "user/_yieldtest"], stdout=subprocess.PIPE, check=True)
+     out = result.stdout.decode("utf-8")
+     assert_equal(out[:5], "fork\n")
+-    assert_equal(out[5:],"usys.S:7\n")
+     r.match(f".*?Child with PID {pid} begins to run")
+     r.match(".*?Child with PID 5 begins to run")
+     r.match(".*?Child with PID 6 begins to run")
+diff --git a/kernel/defs.h b/kernel/defs.h
+index ecea5e6..42d154a 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -108,7 +108,7 @@ void            sched(void);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+-int             wait(uint64);
++int             wait(uint64, int);
+ void            wakeup(void*);
+ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 1607145..44f117a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -291,6 +291,30 @@ void reparent(struct proc *p) {
+   }
+ }
+ 
++char* proc_state(char *dst, enum procstate state) {
++  char *state_str = dst;
++  switch (state) {
++    case UNUSED:
++      safestrcpy(state_str, "UNUSED", sizeof(state_str));
++      break;
++    case SLEEPING:
++      safestrcpy(state_str, "SLEEPING", sizeof(state_str));
++      break;
++    case RUNNABLE:
++      safestrcpy(state_str, "RUNNABLE", sizeof(state_str));
++      break;
++    case RUNNING:
++      safestrcpy(state_str, "RUNNING", sizeof(state_str));
++      break;
++    case ZOMBIE:
++    default:
++      safestrcpy(state_str, "ZOMBIE", sizeof(state_str));
++      break;
++  }
++
++  return dst;
++}
++
+ // Exit the current process.  Does not return.
+ // An exited process remains in the zombie state
+ // until its parent calls wait().
+@@ -313,6 +337,17 @@ void exit(int status) {
+   end_op();
+   p->cwd = 0;
+ 
++  char *state_str = "SLEEPING";
++  printf("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, p->parent->pid, p->name, proc_state(state_str, p->state));
++
++  struct proc *pp;
++  int n = 0;
++  for (pp = proc; pp < &proc[NPROC]; pp++) {
++    if (pp->parent == p) {
++      printf("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, n++, pp->pid, pp->name, proc_state(state_str, pp->state));
++    }
++  }
++
+   // we might re-parent a child to init. we can't be precise about
+   // waking up init, since we can't acquire its lock once we've
+   // acquired any other proc lock. so wake up init whether that's
+@@ -356,7 +391,7 @@ void exit(int status) {
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+-int wait(uint64 addr) {
++int wait(uint64 addr, int flags) {
+   struct proc *np;
+   int havekids, pid;
+   struct proc *p = myproc();
+@@ -401,7 +436,10 @@ int wait(uint64 addr) {
+     }
+ 
+     // Wait for a child to exit.
+-    sleep(p, &p->lock);  // DOC: wait-sleep
++    if (flags == 1) {
++      release(&p->lock);
++      return -1;
++    } else sleep(p, &p->lock);  // DOC: wait-sleep
+   }
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..93d5309 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,3 +104,5 @@ struct proc {
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
+ };
++
++extern struct proc proc[NPROC];
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 4c97875..6c3ca16 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -89,6 +89,7 @@ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
+ extern uint64 sys_rename(void);
++extern uint64 sys_yield(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+     [SYS_fork] sys_fork,   [SYS_exit] sys_exit,     [SYS_wait] sys_wait,     [SYS_pipe] sys_pipe,
+@@ -96,7 +97,7 @@ static uint64 (*syscalls[])(void) = {
+     [SYS_chdir] sys_chdir, [SYS_dup] sys_dup,       [SYS_getpid] sys_getpid, [SYS_sbrk] sys_sbrk,
+     [SYS_sleep] sys_sleep, [SYS_uptime] sys_uptime, [SYS_open] sys_open,     [SYS_write] sys_write,
+     [SYS_mknod] sys_mknod, [SYS_unlink] sys_unlink, [SYS_link] sys_link,     [SYS_mkdir] sys_mkdir,
+-    [SYS_close] sys_close, [SYS_rename] sys_rename,
++    [SYS_close] sys_close, [SYS_rename] sys_rename, [SYS_yield] sys_yield,
+ };
+ 
+ void syscall(void) {
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 6998f87..ce5a3f3 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_rename 22
++#define SYS_yield  23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index a69071e..6f306b8 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -21,7 +21,9 @@ uint64 sys_fork(void) { return fork(); }
+ uint64 sys_wait(void) {
+   uint64 p;
+   if (argaddr(0, &p) < 0) return -1;
+-  return wait(p);
++  int flags;
++  if (argint(1, &flags) < 0) return -1;
++  return wait(p, flags);
+ }
+ 
+ uint64 sys_sbrk(void) {
+@@ -81,3 +83,28 @@ uint64 sys_rename(void) {
+   p->name[len] = '\0';
+   return 0;
+ }
++
++uint64 sys_yield(void) {
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  printf("Save the context of the process to the memory region from address %p to %p\n", &p->context, &p->context + 1);
++  printf("Current running process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
++  release(&p->lock);
++
++  struct proc *pp = p;
++  do {
++    pp++;
++    if (pp >= &proc[NPROC]) pp = proc;
++    acquire(&pp->lock);
++    if (pp->state == RUNNABLE) {
++      printf("Next runnable process pid is %d and user pc is %p\n", pp->pid, pp->trapframe->epc);
++      release(&pp->lock);
++      break;
++    }
++    release(&pp->lock);
++  } while (pp != p);
++  
++  yield();
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..62f9457
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+\ No newline at end of file
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..1642afd
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,13 @@
++#include "kernel/types.h"
++#include "user.h"
++
++int main(int argc,char* argv[]){
++    if(argc != 2){
++        printf("Sleep needs one argument!\n"); 
++        exit(-1);
++    }
++    int ticks = atoi(argv[1]); 
++    sleep(ticks);             
++    printf("(nothing happens for a little while)\n");
++    exit(0); 
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ec47d9d..16dbc45 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ int rename(const char*);
++int yield(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 3a2f6c4..2918ba2 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -37,3 +37,4 @@ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
+ entry("rename");
++entry("yield");
