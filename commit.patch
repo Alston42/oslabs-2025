@@ -1,0 +1,339 @@
+diff --git a/.gitignore b/.gitignore
+index 29b599f..bfc6894 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,4 @@ barrier
+ compile_commands.json
+ .gdb_history
+ .cache/
++commit.patch
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 6d33c99..d9a1c31 100644
+--- a/Makefile
++++ b/Makefile
+@@ -327,15 +327,8 @@ ping:
+ 	python3 ping.py $(FWDPORT)
+ endif
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/kernel/bio.c b/kernel/bio.c
+index 60d91a6..63299cd 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -22,68 +22,143 @@
+ #include "defs.h"
+ #include "fs.h"
+ #include "buf.h"
++#include <limits.h>
++#include <stddef.h>
+ 
++#define NBUCKETS 13
+ struct {
+-  struct spinlock lock;
++  struct spinlock glblock;
++  struct spinlock lock[NBUCKETS];
+   struct buf buf[NBUF];
+-
+-  // Linked list of all buffers, through prev/next.
+-  // Sorted by how recently the buffer was used.
+-  // head.next is most recent, head.prev is least.
+-  struct buf head;
++  struct buf bucket[NBUCKETS];
+ } bcache;
+ 
++static uint
++hash(uint dev, uint blockno)
++{
++  return blockno % NBUCKETS;
++}
++
+ void
+ binit(void)
+ {
+   struct buf *b;
+ 
+-  initlock(&bcache.lock, "bcache");
++  initlock(&bcache.glblock, "bcache");
++
++  for (int i = 0; i < NBUCKETS; i++) {
++    initlock(&bcache.lock[i], "bcache");
++    bcache.bucket[i].next = &bcache.bucket[i];
++    bcache.bucket[i].prev = &bcache.bucket[i];
++  }
+ 
+-  // Create linked list of buffers
+-  bcache.head.prev = &bcache.head;
+-  bcache.head.next = &bcache.head;
+-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
++  for (b = bcache.buf; b < bcache.buf+NBUF; b++) {
++    struct buf *head = bcache.bucket + hash(b->dev, b->blockno);
++    b->next = head->next;
++    b->prev = head;
+     initsleeplock(&b->lock, "buffer");
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    head->next->prev = b;
++    head->next = b;
+   }
+ }
+ 
+-// Look through buffer cache for block on device dev.
+-// If not found, allocate a buffer.
+-// In either case, return locked buffer.
+ static struct buf*
+-bget(uint dev, uint blockno)
++bsearch(struct buf *head, uint dev, uint blockno)
+ {
+   struct buf *b;
+-
+-  acquire(&bcache.lock);
+-
+   // Is the block already cached?
+-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
++  for(b = head->next; b != head; b = b->next){
+     if(b->dev == dev && b->blockno == blockno){
+       b->refcnt++;
+-      release(&bcache.lock);
+-      acquiresleep(&b->lock);
+       return b;
+     }
+   }
++  return NULL;
++}
+ 
+-  // Not cached.
+-  // Recycle the least recently used (LRU) unused buffer.
+-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
++static void
++binsert(struct buf *head, struct buf *b)
++{
++  b->next = head->next;
++  b->prev = head;
++  head->next->prev = b;
++  head->next = b;
++}
++
++static struct buf*
++balloc(struct buf *head, uint dev, uint blockno)
++{
++  struct buf *b;
++  for(b = head->prev; b != head; b = b->prev){
+     if(b->refcnt == 0) {
+       b->dev = dev;
+       b->blockno = blockno;
+       b->valid = 0;
+       b->refcnt = 1;
+-      release(&bcache.lock);
++      return b;
++    }
++  }
++  return NULL;
++}
++// Look through buffer cache for block on device dev.
++// If not found, allocate a buffer.
++// In either case, return locked buffer.
++static struct buf*
++bget(uint dev, uint blockno)
++{
++  uint id = hash(dev, blockno);
++  struct spinlock *lk = &bcache.lock[id];
++  struct buf *bkt = &bcache.bucket[id];
++
++  acquire(lk);
++  
++  struct buf *b = bsearch(bkt, dev, blockno);
++  if (b) {
++    release(lk);
++    acquiresleep(&b->lock);
++    return b;
++  }
++
++  // Not cached.
++  // Recycle the least recently used (LRU) unused buffer.
++  release(lk);
++  acquire(&bcache.glblock);
++  acquire(lk);
++  // Search Again
++  b = bsearch(bkt, dev, blockno);
++  if (b) {
++    release(lk);
++    release(&bcache.glblock);
++    acquiresleep(&b->lock);
++    return b;
++  }
++  // Alloc in BUCKET
++  b = balloc(bkt, dev, blockno);
++  if (b) {
++    release(lk);
++    release(&bcache.glblock);
++    acquiresleep(&b->lock);
++    return b;
++  }
++  // Alloc in Other BUCKETs
++  struct buf *bkt2;
++  for (int i = 0; i < NBUCKETS; i++) {
++    bkt2 = bcache.bucket + i;
++    if (bkt2 == bkt) continue;
++    acquire(bcache.lock + i);
++    b = balloc(bkt2, dev, blockno);
++    if (b) {
++      b->prev->next = b->next;
++      b->next->prev = b->prev;
++      binsert(bkt, b);
++      
++      release(bcache.lock + i);
++      release(lk);
++      release(&bcache.glblock);
+       acquiresleep(&b->lock);
+       return b;
+     }
++    release(bcache.lock + i);
+   }
+   panic("bget: no buffers");
+ }
+@@ -121,33 +196,33 @@ brelse(struct buf *b)
+ 
+   releasesleep(&b->lock);
+ 
+-  acquire(&bcache.lock);
++  int id = hash(b->dev, b->blockno);
++  struct spinlock *lk = &bcache.lock[id];
++  acquire(lk);
+   b->refcnt--;
+   if (b->refcnt == 0) {
+     // no one is waiting for it.
+     b->next->prev = b->prev;
+     b->prev->next = b->next;
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    binsert(&bcache.bucket[id], b);
+   }
+   
+-  release(&bcache.lock);
++  release(lk);
+ }
+-
+ void
+ bpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  struct spinlock *lk = &bcache.lock[hash(b->dev, b->blockno)];
++  acquire(lk);
+   b->refcnt++;
+-  release(&bcache.lock);
++  release(lk);
+ }
+ 
+ void
+ bunpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  struct spinlock *lk = &bcache.lock[hash(b->dev, b->blockno)];
++  acquire(lk);
+   b->refcnt--;
+-  release(&bcache.lock);
++  release(lk);
+ }
+ 
+ 
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..87dd8ae 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -18,15 +18,18 @@ struct run {
+   struct run *next;
+ };
+ 
+-struct {
++struct kmem {
+   struct spinlock lock;
+   struct run *freelist;
+-} kmem;
++};
++
++struct kmem kmems[NCPU];
+ 
+ void
+ kinit()
+ {
+-  initlock(&kmem.lock, "kmem");
++  for (int i = 0; i < NCPU; i++)
++    initlock(&kmems[i].lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -56,10 +59,13 @@ kfree(void *pa)
+ 
+   r = (struct run*)pa;
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  push_off();
++  struct kmem *kmem = kmems + cpuid();
++  acquire(&kmem->lock);
++  r->next = kmem->freelist;
++  kmem->freelist = r;
++  release(&kmem->lock);
++  pop_off();
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -70,11 +76,29 @@ kalloc(void)
+ {
+   struct run *r;
+ 
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
++  push_off();
++  struct kmem *kmem = kmems + cpuid();
++  acquire(&kmem->lock);
++  r = kmem->freelist;
+   if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
++    kmem->freelist = r->next;
++  release(&kmem->lock);
++
++  if(!r) {
++    for (int i = 0; i < NCPU; i++) {
++      if (i == cpuid()) continue;
++      kmem = kmems + i;
++      acquire(&kmem->lock);
++      r = kmem->freelist;
++      if (r) {
++        kmem->freelist = r->next;
++        release(&kmem->lock);
++        break;
++      }
++      release(&kmem->lock);
++    }
++  }
++  pop_off();
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..62f9457
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+\ No newline at end of file

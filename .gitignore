@@ -25,4 +25,3 @@ barrier
 compile_commands.json
 .gdb_history
 .cache/
-commit.patch
