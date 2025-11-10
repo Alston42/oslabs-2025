@@ -93,6 +93,7 @@ int exec(char *path, char **argv) {
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
   p->sz = sz;
+  sync_pagetable(p->k_pagetable, p->pagetable, p->sz);
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp;          // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);

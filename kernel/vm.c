@@ -337,21 +337,10 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int res = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return res;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -359,38 +348,10 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int res = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return res;
 }
 
 // check if use global kpgtbl or not
@@ -434,4 +395,28 @@ void vmprint(pagetable_t pgtbl) {
   printf("page table %p\n", pgtbl);
   
   vmprintwalk(pgtbl, 0, 0);
+}
+
+// 将用户页表同步到内核页表
+void sync_pagetable(pagetable_t k_pagetable, pagetable_t u_pagetable, uint64 sz) {
+  // 遍历用户页表，将有效的用户映射复制到内核页表
+  for(uint64 va = 0; va < sz; va += PGSIZE) {
+    pte_t *u_pte = walk(u_pagetable, va, 0);
+    if (u_pte == 0 || (*u_pte & PTE_V) == 0) continue; // 跳过无效的页表项
+    if ((*u_pte & PTE_U) == 0) continue; // 跳过非用户页
+    
+    uint64 pa = PTE2PA(*u_pte);
+    int flags = (PTE_FLAGS(*u_pte) & ~PTE_U); // 移除用户标志位
+    
+    // 在内核页表中建立映射（不使用PTE_U标志）
+    pte_t *k_pte = walk(k_pagetable, va, 1);
+    if (k_pte == 0) {
+      panic("sync_user_mappings: walk failed");
+    }
+    
+    // 如果已经映射，先取消映射
+    if (*k_pte & PTE_V) *k_pte = 0;
+    
+    *k_pte = PA2PTE(pa) | flags | PTE_V;
+  }
 }
